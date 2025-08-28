@@ -7,22 +7,22 @@ from datetime import datetime
 import time
 from app_store_scraper import AppStore
 from google_play_scraper import Sort, reviews
+from urllib.parse import quote # 引入 URL 编码函式
 
 # ===================================================================
-# V5.2 最终修复版
-# 修正: 修复了第 130 行的 f-string 语法错误
+# V5.3 终极修复版
+# 修正: 1. 修复 iOS 爬虫 app_name 参数缺失问题 (加入 URL 编码)
+#      2. 修复 Dify API 调用认证讯息格式问题 (加入 .strip())
 # ===================================================================
 
 print("--- main.py 脚本开始执行 ---")
 
-# ... (前面 1-3 部分的代码完全不变，这里为了简洁先省略) ...
-# 为了避免混淆，还是提供完整版
-
 # 1. 读取凭证
 print("\nSTEP 1: 正在从环境变数读取凭证...")
 try:
-    dify_api_key = os.environ['DIFY_API_KEY']
-    dify_api_url = os.environ['DIFY_API_URL']
+    # V5.3 修正：对读取的金钥进行 .strip()，清除可能存在的多余空格或换行符
+    dify_api_key = os.environ['DIFY_API_KEY'].strip()
+    dify_api_url = os.environ['DIFY_API_URL'].strip()
     google_creds_json = os.environ['GOOGLE_SHEETS_CREDENTIALS']
     google_creds_dict = json.loads(google_creds_json)
     print("✅ 成功读取所有凭证。")
@@ -48,7 +48,7 @@ def analyze_with_dify(comment):
     headers = {"Authorization": f"Bearer {dify_api_key}", "Content-Type": "application/json"}
     payload = {"inputs": {"review_text": comment}, "response_mode": "blocking", "user": "github-actions-scraper"}
     try:
-        response = requests.post(dify_api_url, headers=headers, json=payload, timeout=60)
+        response = requests.post(dify_api_url, headers=headers, json=payload, timeout=90) # 延长超时时间
         response.raise_for_status()
         result_text = response.json().get('outputs', {}).get('analysis_result')
         if not result_text: raise KeyError("'analysis_result' not found in Dify response.")
@@ -71,10 +71,15 @@ def get_reviews_and_filter():
         print(f"  ▶️  正在处理: {app['name']} ({app['platform']})")
         try:
             if app['platform'] == 'iOS':
-                scraper = AppStore(country='tw', app_id=app['id']); scraper.review(how_many=100)
+                # V5.3 修正：重新加入 app_name 并进行 URL 编码
+                app_name_encoded = quote(app['name'])
+                scraper = AppStore(country='tw', app_name=app_name_encoded, app_id=app['id'])
+                scraper.review(how_many=100)
                 reviews_list = scraper.reviews
-            else:
+            else: # Android
                 reviews_list, _ = reviews(app['id'], lang='zh-TW', country='tw', sort=Sort.NEWEST, count=100)
+            
+            print(f"    └─ 成功抓取 {len(reviews_list)} 笔原始评论。")
             for review in reviews_list:
                 all_new_reviews.append({
                     'app_name': app['name'], 'platform': app['platform'],
@@ -83,6 +88,7 @@ def get_reviews_and_filter():
                     'date': (review.get('date') or review.get('at')).strftime('%Y-%m-%d %H:%M:%S')
                 })
         except Exception as e: print(f"    └─ ⚠️ 抓取失败: {e}")
+    
     if not all_new_reviews: return []
     df = pd.DataFrame(all_new_reviews); df.drop_duplicates(subset=['comment'], inplace=True, keep='first')
     DIFY_WEEKLY_LIMIT = 40
@@ -102,10 +108,8 @@ if __name__ == "__main__":
     if reviews_to_process:
         print("\nSTEP 4: 正在发送评论给 Dify 进行分析...")
         for i, review in enumerate(reviews_to_process):
-            # V5.2 修正处：将 .replace('\n', ' ') 移到 f-string 外部，避免语法错误
             comment_preview = review['comment'][:40].replace('\n', ' ')
             print(f"  - 分析中 {i+1}/{len(reviews_to_process)} ({review['app_name']}): \"{comment_preview}...\"")
-            
             ai_result = analyze_with_dify(review['comment'])
             if ai_result:
                 print(f"    └─ 🤖 AI 结果: {ai_result}")
@@ -116,19 +120,13 @@ if __name__ == "__main__":
                     'AI總結': ai_result.get('summary'), '處理時間': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 })
             else: print("    └─ ⚠️ 分析失败，跳过。")
-            time.sleep(1)
+            time.sleep(2) # 稍微增加等待时间，让 Dify API 更稳定
             
     if final_results_to_sheet:
         print(f"\nSTEP 5: 正在将 {len(final_results_to_sheet)} 笔结果写入 Google Sheets...")
         try:
             headers = list(final_results_to_sheet[0].keys())
-            try:
-                sheet_headers = worksheet.row_values(1)
-            except gspread.exceptions.APIError: sheet_headers = []
-            
-            # 简化逻辑：每次都清空并重写，以避免 POC 阶段数据重复
-            print("  - 正在清空工作表并写入新数据...")
-            worksheet.clear()
+            worksheet.clear() # 每次都清空重写
             worksheet.update('A1', [headers])
             values_to_append = [list(row.values()) for row in final_results_to_sheet]
             worksheet.append_rows(values_to_append, value_input_option='USER_ENTERED')
