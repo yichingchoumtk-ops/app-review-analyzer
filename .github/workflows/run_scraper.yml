@@ -28,4 +28,12 @@ jobs:
           DIFY_API_KEY: ${{ secrets.DIFY_API_KEY }}
           DIFY_API_URL: ${{ secrets.DIFY_API_URL }}
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
-        run: python main.py
+        run: |
+          echo "--- 偵錯模式：檢查環境變數 ---"
+          echo "DIFY_API_URL 存在: ${{ env.DIFY_API_URL != '' }}"
+          echo "DIFY_API_KEY 是否設定: ${{ env.DIFY_API_KEY != '' }}"
+          echo "GOOGLE_SHEETS_CREDENTIALS 是否設定: ${{ env.GOOGLE_SHEETS_CREDENTIALS != '' }}"
+          echo "---------------------------------"
+          echo " "
+          echo "--- 開始執行 Python 主程式 ---"
+          python main.py
