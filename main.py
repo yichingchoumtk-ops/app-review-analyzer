@@ -5,22 +5,21 @@ import pandas as pd
 import gspread
 from datetime import datetime
 import time
-from app_store_scraper import AppStore
 from google_play_scraper import Sort, reviews
-from urllib.parse import quote # 引入 URL 编码函式
+import re # 引入正則表達式函式庫
 
 # ===================================================================
-# V5.3 终极修复版
-# 修正: 1. 修复 iOS 爬虫 app_name 参数缺失问题 (加入 URL 编码)
-#      2. 修复 Dify API 调用认证讯息格式问题 (加入 .strip())
+# V6.0 生产版
+# 1. 移除所有 iOS 爬虫代码，专注于 Android
+# 2. 新增“投资先生” App
+# 3. 彻底重构 Dify 调用逻辑，增加重试与贪婪 JSON 解析，确保稳定性
 # ===================================================================
 
-print("--- main.py 脚本开始执行 ---")
+print("--- main.py 脚本开始执行 (V6.0 生产版) ---")
 
 # 1. 读取凭证
 print("\nSTEP 1: 正在从环境变数读取凭证...")
 try:
-    # V5.3 修正：对读取的金钥进行 .strip()，清除可能存在的多余空格或换行符
     dify_api_key = os.environ['DIFY_API_KEY'].strip()
     dify_api_url = os.environ['DIFY_API_URL'].strip()
     google_creds_json = os.environ['GOOGLE_SHEETS_CREDENTIALS']
@@ -43,49 +42,71 @@ except Exception as e:
     print(f"❌ 连接 Google Sheets 时发生致命错误: {e}")
     exit(1)
 
-# 3. 定义 Dify AI 分析功能
-def analyze_with_dify(comment):
+# 3. 定义 Dify AI 分析功能 (V6.0 核心重构)
+def analyze_with_dify(comment, max_retries=2):
+    """
+    调用 Dify Workflow API，内置重试与贪婪 JSON 解析逻辑。
+    """
     headers = {"Authorization": f"Bearer {dify_api_key}", "Content-Type": "application/json"}
     payload = {"inputs": {"review_text": comment}, "response_mode": "blocking", "user": "github-actions-scraper"}
-    try:
-        response = requests.post(dify_api_url, headers=headers, json=payload, timeout=90) # 延长超时时间
-        response.raise_for_status()
-        result_text = response.json().get('outputs', {}).get('analysis_result')
-        if not result_text: raise KeyError("'analysis_result' not found in Dify response.")
-        return json.loads(result_text)
-    except Exception as e:
-        print(f"  └─ ❌ Dify 分析失败: {e}")
-        return None
+    
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(dify_api_url, headers=headers, json=payload, timeout=90)
+            response.raise_for_status()
+            raw_text = response.text
+
+            # 贪婪的 JSON 提取器：寻找第一个 '{' 和最后一个 '}'
+            match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+            if match:
+                json_str = match.group(0)
+                # 尝试解析提取出的 JSON 字串
+                result = json.loads(json_str)
+                # 假设 Dify 工作流的输出包裹在 'outputs.analysis_result' 中
+                # 如果直接是结果 JSON，则直接返回
+                if 'outputs' in result and 'analysis_result' in result['outputs']:
+                     # 如果 analysis_result 本身也是一个 JSON 字符串，需要再次解析
+                    if isinstance(result['outputs']['analysis_result'], str):
+                        return json.loads(result['outputs']['analysis_result'])
+                    else:
+                        return result['outputs']['analysis_result']
+                else: # 兼容 Dify 直接返回分析结果的 JSON
+                    return result
+
+            else: # 如果连 JSON 的影子都找不到
+                print(f"  └─ ⚠️ Dify 回应中未找到有效的 JSON 结构。回应: {raw_text[:100]}...")
+                raise ValueError("No JSON object found in response")
+
+        except Exception as e:
+            print(f"  └─ ❌ Dify 分析尝试 {attempt + 1}/{max_retries} 失败: {e}")
+            if attempt < max_retries - 1:
+                print("     └─ 3秒后重试...")
+                time.sleep(3)
+            else:
+                return None # 所有重试均失败
+    return None
 
 # 4. 定义爬虫与筛选功能
 def get_reviews_and_filter():
-    print("\nSTEP 3: 开始抓取与筛选评论...")
+    print("\nSTEP 3: 开始抓取与筛选 Android 评论...")
     apps_to_scrape = [
-        {'name': '三竹股市', 'platform': 'iOS', 'id': '352743563'},
-        {'name': '三竹股市', 'platform': 'Android', 'id': 'com.mtk'},
-        {'name': '富果 Fugle', 'platform': 'iOS', 'id': '1542310263'},
-        {'name': '富果 Fugle', 'platform': 'Android', 'id': 'tw.fugle.flutter.app'},
+        {'name': '三竹股市', 'id': 'com.mtk'},
+        {'name': '富果 Fugle', 'id': 'tw.fugle.flutter.app'},
+        {'name': 'XQ 全球贏家', 'id': 'djapp.app.xqm'},
+        {'name': '投資先生', 'id': 'com.yuanta.android.nexus'}, # 新增 App
     ]
     all_new_reviews = []
     for app in apps_to_scrape:
-        print(f"  ▶️  正在处理: {app['name']} ({app['platform']})")
+        print(f"  ▶️  正在处理: {app['name']}")
         try:
-            if app['platform'] == 'iOS':
-                # V5.3 修正：重新加入 app_name 并进行 URL 编码
-                app_name_encoded = quote(app['name'])
-                scraper = AppStore(country='tw', app_name=app_name_encoded, app_id=app['id'])
-                scraper.review(how_many=100)
-                reviews_list = scraper.reviews
-            else: # Android
-                reviews_list, _ = reviews(app['id'], lang='zh-TW', country='tw', sort=Sort.NEWEST, count=100)
-            
+            reviews_list, _ = reviews(app['id'], lang='zh-TW', country='tw', sort=Sort.NEWEST, count=100)
             print(f"    └─ 成功抓取 {len(reviews_list)} 笔原始评论。")
             for review in reviews_list:
                 all_new_reviews.append({
-                    'app_name': app['name'], 'platform': app['platform'],
-                    'comment': str(review.get('review') or review.get('content', '')),
-                    'rating': int(review.get('rating') or review.get('score', 0)),
-                    'date': (review.get('date') or review.get('at')).strftime('%Y-%m-%d %H:%M:%S')
+                    'app_name': app['name'], 'platform': 'Android',
+                    'comment': str(review.get('content', '')),
+                    'rating': int(review.get('score', 0)),
+                    'date': review.get('at').strftime('%Y-%m-%d %H:%M:%S')
                 })
         except Exception as e: print(f"    └─ ⚠️ 抓取失败: {e}")
     
@@ -120,7 +141,7 @@ if __name__ == "__main__":
                     'AI總結': ai_result.get('summary'), '處理時間': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 })
             else: print("    └─ ⚠️ 分析失败，跳过。")
-            time.sleep(2) # 稍微增加等待时间，让 Dify API 更稳定
+            time.sleep(2)
             
     if final_results_to_sheet:
         print(f"\nSTEP 5: 正在将 {len(final_results_to_sheet)} 笔结果写入 Google Sheets...")
